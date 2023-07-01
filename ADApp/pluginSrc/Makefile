@@ -9,6 +9,8 @@ DBD         += NDPluginSupport.dbd
 
 # Persuade travis (ubuntu 12.04) to use HDF5 API V2 (1.8 rather than default 1.6)
 USR_CXXFLAGS_Linux += -DH5_NO_DEPRECATED_SYMBOLS -DH5Gopen_vers=2
+USR_CXXFLAGS += -fopenmp -ffast-math
+USR_LDFLAGS += -fopenmp
 
 # json.hpp requires C++11
 NDPluginBadPixel_CXXFLAGS_Linux += -std=c++11

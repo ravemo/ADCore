@@ -16,6 +16,8 @@
 
 #include <epicsExport.h>
 
+#include <omp.h>
+
 #define MAX(A,B) (A)>(B)?(A):(B)
 #define MIN(A,B) (A)<(B)?(A):(B)
 
@@ -191,7 +193,7 @@ template <typename epicsType>
 asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 {
     epicsType *pData = (epicsType *)pArray->pData;
-    double value, *pValue, *pThresh, varX, varY, varXY;
+    double *pValue, *pThresh, varX, varY, varXY;
     size_t ix, iy;
     /*Raw moments */
     double M00 = 0.0;
@@ -204,18 +206,41 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 
     if (pArray->ndims > 2) return(asynError);
 
-    for (iy=0; iy<pStats->profileSizeY; iy++) {
-        for (ix=0; ix<pStats->profileSizeX; ix++) {
-            value = (double)*pData++;
-            pStats->profileX[profAverage][ix] += value;
-            pStats->profileY[profAverage][iy] += value;
-            if (value >= pStats->centroidThreshold) {
-                pStats->profileX[profThreshold][ix] += value;
-                pStats->profileY[profThreshold][iy] += value;
-                M11 += value * ix * iy;
-            }
+    const unsigned int w = pStats->profileSizeX;
+    const unsigned int h = pStats->profileSizeY;
+    #pragma omp parallel for private(ix)
+    for (ix=0; ix<w; ix++) {
+        #pragma omp simd private(iy)
+        for (iy=0; iy<h; iy++) {
+            pStats->profileX[profAverage][ix] += pData[ix + w*iy];
+            pStats->profileX[profThreshold][ix] += pData[ix + w*iy] >= pStats->centroidThreshold ? pData[ix + w*iy] : 0; 
         }
     }
+    #pragma omp parallel for private(iy)
+    for (iy=0; iy<h; iy++) {
+        const unsigned int offset = w*iy;
+        #pragma omp simd private(ix)
+        for (ix=0; ix<w; ix++) {
+            pStats->profileY[profAverage][iy] += pData[ix + offset];
+            pStats->profileY[profThreshold][iy] += pData[ix + offset] >= pStats->centroidThreshold ? pData[ix + offset] : 0; 
+        }
+    }
+
+    // array to help vectorize the next loop
+    size_t *idx_x = (size_t*) malloc(sizeof(size_t) * w);
+    #pragma omp simd private(ix)
+    for(ix=0; ix<w; ix++)
+        idx_x[ix] = ix;
+
+    #pragma omp parallel reduction(+:M11) private(ix, iy)
+    for (ix=0; ix<w; ix++) {
+        double tmp_M11 = 0.0;
+        #pragma omp simd reduction(+:tmp_M11) private(iy)
+        for (iy=0; iy<h; iy++) 
+            tmp_M11 += pData[ix + w*iy] >= pStats->centroidThreshold ? pData[ix + w*iy] * idx_x[ix] * iy : 0;
+        M11 += tmp_M11;
+    }
+    free(idx_x);
 
     /* Normalize the average profiles and compute the centroid from them */
     pValue  = pStats->profileX[profAverage];
