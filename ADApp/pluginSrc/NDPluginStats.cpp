@@ -210,8 +210,8 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     if (pArray->ndims > 2) return(asynError);
 
     #pragma openmp parallel for collapse(2) reduction(+:M11, \
-    pStats->profileX[profAverage], pStats->profileY[profAverage], \
-    pStats->profileX[profThreshold], pStats->profileY[profThreshold]) \
+    pStats->profileX[profAverage][:], pStats->profileY[profAverage][:], \
+    pStats->profileX[profThreshold][:], pStats->profileY[profThreshold][:]) \
     private(ix, iy)
     for (iy=0; iy<pStats->profileSizeY; iy++) {
         for (ix=0; ix<pStats->profileSizeX; ix++) {
@@ -294,7 +294,7 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
         }
     }
     double ftime = omp_get_wtime();
-    printf("Time taken is %f\n", ftime-itime);
+    //printf("Time taken is %f\n", ftime-itime);
     return(asynSuccess);
 }
 
