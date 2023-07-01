@@ -209,19 +209,24 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 
     if (pArray->ndims > 2) return(asynError);
 
-    #pragma openmp parallel for collapse(2) reduction(+:M11, \
-    pStats->profileX[profAverage][:], pStats->profileY[profAverage][:], \
-    pStats->profileX[profThreshold][:], pStats->profileY[profThreshold][:]) \
+    const size_t w = pStats->profileSizeX;
+    const size_t h = pStats->profileSizeY;
+    double* px_avg = pStats->profileX[profAverage];
+    double* py_avg = pStats->profileY[profAverage];
+    double* px_thr = pStats->profileX[profThreshold];
+    double* py_thr = pStats->profileY[profThreshold];
+    #pragma omp parallel for collapse(2) reduction(+:M11, \
+    px_avg[:w], py_avg[:h], px_thr[:w], py_thr[:h]) \
     private(ix, iy)
     for (iy=0; iy<pStats->profileSizeY; iy++) {
         for (ix=0; ix<pStats->profileSizeX; ix++) {
             const int i = iy*pStats->profileSizeX + ix;
             const double value = pData[i];
-            pStats->profileX[profAverage][ix] += value;
-            pStats->profileY[profAverage][iy] += value;
+            px_avg[ix] += value;
+            py_avg[iy] += value;
             if (value >= pStats->centroidThreshold) {
-                pStats->profileX[profThreshold][ix] += value;
-                pStats->profileY[profThreshold][iy] += value;
+                px_thr[ix] += value;
+                py_thr[iy] += value;
                 M11 += value * ix * iy;
             }
         }
@@ -542,16 +547,23 @@ void NDPluginStats::processCallbacks(NDArray *pArray)
         }
     }
 
+    #pragma omp parallel
+    #pragma omp single
+    {
     if (computeCentroid) {
+        #pragma omp task depend(out: pStats)
          doComputeCentroid(pArray, pStats);
     }
 
     if (computeProfiles) {
+        #pragma omp task depend(in: pStats)
         doComputeProfiles(pArray, pStats);
     }
 
     if (computeHistogram) {
+        #pragma omp task
         doComputeHistogram(pArray, pStats);
+    }
     }
 
 
