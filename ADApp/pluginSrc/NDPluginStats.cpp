@@ -17,6 +17,7 @@
 #include <epicsExport.h>
 
 #include <omp.h>
+#include <stdio.h>
 
 #define MAX(A,B) (A)>(B)?(A):(B)
 #define MIN(A,B) (A)<(B)?(A):(B)
@@ -117,6 +118,7 @@ void NDPluginStats::doComputeStatisticsT(NDArray *pArray, NDStats_t *pStats)
     size_t i, imin, imax;
     epicsType *pData = (epicsType *)pArray->pData;
     NDArrayInfo arrayInfo;
+    double value;
 
     pArray->getInfo(&arrayInfo);
     pStats->nElements = arrayInfo.nElements;
@@ -127,19 +129,17 @@ void NDPluginStats::doComputeStatisticsT(NDArray *pArray, NDStats_t *pStats)
     pStats->total = 0.;
     pStats->sigma = 0.;
     for (i=0; i<pStats->nElements; i++) {
-        if (pData[i] < pStats->min) {
-            pStats->min = pData[i];
+        value = (double)pData[i];
+        if (value < pStats->min) {
+            pStats->min = value;
             imin = i;
         }
-        if (pData[i] > pStats->max) {
-            pStats->max = pData[i];
+        if (value > pStats->max) {
+            pStats->max = value;
             imax = i;
         }
-    }
-    #pragma simd reduce(+:pStats->total, pStats->sigma)
-    for (i=0; i<pStats->nElements; i++) {
-        pStats->total += pData[i];
-        pStats->sigma += pData[i] * pData[i];
+        pStats->total += value;
+        pStats->sigma += value * value;
     }
     pStats->minX = imin % arrayInfo.xSize;
     pStats->minY = imin / arrayInfo.xSize;
@@ -194,6 +194,7 @@ int NDPluginStats::doComputeStatistics(NDArray *pArray, NDStats_t *pStats)
 template <typename epicsType>
 asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 {
+    double itime = omp_get_wtime();
     epicsType *pData = (epicsType *)pArray->pData;
     double *pValue, *pThresh, varX, varY, varXY;
     size_t ix, iy;
@@ -208,41 +209,23 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 
     if (pArray->ndims > 2) return(asynError);
 
-    const unsigned int w = pStats->profileSizeX;
-    const unsigned int h = pStats->profileSizeY;
-    #pragma omp parallel for private(ix)
-    for (ix=0; ix<w; ix++) {
-        #pragma omp simd private(iy)
-        for (iy=0; iy<h; iy++) {
-            pStats->profileX[profAverage][ix] += pData[ix + w*iy];
-            pStats->profileX[profThreshold][ix] += pData[ix + w*iy] >= pStats->centroidThreshold ? pData[ix + w*iy] : 0; 
+    #pragma openmp parallel for collapse(2) reduction(+:M11, \
+    pStats->profileX[profAverage], pStats->profileY[profAverage], \
+    pStats->profileX[profThreshold], pStats->profileY[profThreshold]) \
+    private(ix, iy)
+    for (iy=0; iy<pStats->profileSizeY; iy++) {
+        for (ix=0; ix<pStats->profileSizeX; ix++) {
+            const int i = iy*pStats->profileSizeX + ix;
+            const double value = pData[i];
+            pStats->profileX[profAverage][ix] += value;
+            pStats->profileY[profAverage][iy] += value;
+            if (value >= pStats->centroidThreshold) {
+                pStats->profileX[profThreshold][ix] += value;
+                pStats->profileY[profThreshold][iy] += value;
+                M11 += value * ix * iy;
+            }
         }
     }
-    #pragma omp parallel for private(iy)
-    for (iy=0; iy<h; iy++) {
-        const unsigned int offset = w*iy;
-        #pragma omp simd private(ix)
-        for (ix=0; ix<w; ix++) {
-            pStats->profileY[profAverage][iy] += pData[ix + offset];
-            pStats->profileY[profThreshold][iy] += pData[ix + offset] >= pStats->centroidThreshold ? pData[ix + offset] : 0; 
-        }
-    }
-
-    // array to help vectorize the next loop
-    size_t *idx_x = (size_t*) malloc(sizeof(size_t) * w);
-    #pragma omp simd private(ix)
-    for(ix=0; ix<w; ix++)
-        idx_x[ix] = ix;
-
-    #pragma omp parallel reduction(+:M11) private(ix, iy)
-    for (ix=0; ix<w; ix++) {
-        double tmp_M11 = 0.0;
-        #pragma omp simd reduction(+:tmp_M11) private(iy)
-        for (iy=0; iy<h; iy++) 
-            tmp_M11 += pData[ix + w*iy] >= pStats->centroidThreshold ? pData[ix + w*iy] * idx_x[ix] * iy : 0;
-        M11 += tmp_M11;
-    }
-    free(idx_x);
 
     /* Normalize the average profiles and compute the centroid from them */
     pValue  = pStats->profileX[profAverage];
@@ -310,6 +293,8 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
                                  ((mu20 + mu02) * (mu20 + mu02));
         }
     }
+    double ftime = omp_get_wtime();
+    printf("Time taken is %f\n", ftime-itime);
     return(asynSuccess);
 }
 
@@ -557,24 +542,18 @@ void NDPluginStats::processCallbacks(NDArray *pArray)
         }
     }
 
-    #pragma omp parallel
-    #pragma omp single
-    {
-        if (computeCentroid) {
-            #pragma omp task depend(out: pStats)
-            doComputeCentroid(pArray, pStats);
-        }
-
-        if (computeProfiles) {
-            #pragma omp task depend(in: pStats) // depends on centroid
-            doComputeProfiles(pArray, pStats);
-        }
-
-        if (computeHistogram) {
-            #pragma omp task
-            doComputeHistogram(pArray, pStats);
-        }
+    if (computeCentroid) {
+         doComputeCentroid(pArray, pStats);
     }
+
+    if (computeProfiles) {
+        doComputeProfiles(pArray, pStats);
+    }
+
+    if (computeHistogram) {
+        doComputeHistogram(pArray, pStats);
+    }
+
 
     // Take the lock again.  The time-series data need to be protected.
     this->lock();
