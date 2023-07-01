@@ -16,6 +16,8 @@
 
 #include <epicsExport.h>
 
+#include <omp.h>
+
 #define MAX(A,B) (A)>(B)?(A):(B)
 #define MIN(A,B) (A)<(B)?(A):(B)
 
@@ -30,32 +32,37 @@ template <typename epicsType>
 asynStatus NDPluginStats::doComputeHistogramT(NDArray *pArray, NDStats_t *pStats)
 {
     epicsType *pData = (epicsType *)pArray->pData;
-    size_t i;
     double scale, entropy;
-    int bin;
     size_t nElements;
-    double value, counts;
+    double counts;
     NDArrayInfo arrayInfo;
 
     pArray->getInfo(&arrayInfo);
     nElements = arrayInfo.nElements;
     scale = (pStats->histSize - 1) / (pStats->histMax - pStats->histMin);
 
-    pStats->histBelow = 0;
-    pStats->histAbove = 0;
-    for (i=0; i<nElements; i++) {
-        value = (double)pData[i];
-        bin = (int)(((value - pStats->histMin) * scale) + 0.5);
+    int histBelow = 0;
+    int histAbove = 0;
+    double* hist = pStats->histogram;
+    const int histSize = pStats->histSize;
+    #pragma omp parallel reduction(+: histBelow, histAbove, hist[:histSize])
+    for (size_t i=0; i<nElements; i++) {
+        double value = pData[i];
+        int bin = (int)(((value - pStats->histMin) * scale) + 0.5);
         if ((bin < 0) || (value < pStats->histMin))
-            pStats->histBelow++;
-        else if ((bin > (int)pStats->histSize-1) || (value > pStats->histMax))
-            pStats->histAbove++;
+            histBelow++;
+        else if ((bin > (int)histSize-1) || (value > pStats->histMax))
+            histAbove++;
         else
-            pStats->histogram[bin]++;
+            hist[bin]++;
     }
 
+    pStats->histBelow = histBelow;
+    pStats->histAbove = histAbove;
+    pStats->histogram = hist;
+
     entropy = 0;
-    for (i=0; (int)i<pStats->histSize; i++) {
+    for (size_t i=0; (int)i<pStats->histSize; i++) {
         counts = pStats->histogram[i];
         if (counts <= 0) counts = 1;
         entropy += counts * log(counts);
@@ -108,39 +115,51 @@ asynStatus NDPluginStats::doComputeHistogram(NDArray *pArray, NDStats_t *pStats)
     return(status);
 }
 
+// This struct is defined to allow parallization of minimum
+// and maximum operations while keeping the indices with OpenMP
+struct Compare {
+    double val;
+    size_t index;
+};
+
+#pragma omp declare reduction(minimum : struct Compare : omp_out = omp_in.val < omp_out.val ? omp_in : omp_out)
+#pragma omp declare reduction(maximum : struct Compare : omp_out = omp_in.val > omp_out.val ? omp_in : omp_out)
+
 template <typename epicsType>
 void NDPluginStats::doComputeStatisticsT(NDArray *pArray, NDStats_t *pStats)
 {
-    size_t i, imin, imax;
     epicsType *pData = (epicsType *)pArray->pData;
     NDArrayInfo arrayInfo;
-    double value;
 
     pArray->getInfo(&arrayInfo);
     pStats->nElements = arrayInfo.nElements;
-    pStats->min = (double) pData[0];
-    imin = 0;
-    pStats->max = (double) pData[0];
-    imax = 0;
     pStats->total = 0.;
     pStats->sigma = 0.;
-    for (i=0; i<pStats->nElements; i++) {
-        value = (double)pData[i];
-        if (value < pStats->min) {
-            pStats->min = value;
-            imin = i;
+
+    struct Compare min{(double)pData[0], 0}, max{(double)pData[0], 0};
+    double total = 0, sigma = 0;
+    #pragma omp parallel for reduction(minimum:min) reduction(maximum:max) reduction(+: total, sigma)
+    for (size_t i=0; i<pStats->nElements; i++) {
+        double value = (double)pData[i];
+        if (value < min.val) {
+            min.val = value;
+            min.index = i;
         }
-        if (value > pStats->max) {
-            pStats->max = value;
-            imax = i;
+        if (value > max.val) {
+            max.val = value;
+            max.index = i;
         }
-        pStats->total += value;
-        pStats->sigma += value * value;
+        total += value;
+        sigma += value * value;
     }
-    pStats->minX = imin % arrayInfo.xSize;
-    pStats->minY = imin / arrayInfo.xSize;
-    pStats->maxX = imax % arrayInfo.xSize;
-    pStats->maxY = imax / arrayInfo.xSize;
+    pStats->total = total;
+    pStats->sigma = sigma;
+    pStats->min = min.val;
+    pStats->max = max.val;
+    pStats->minX = min.index % arrayInfo.xSize;
+    pStats->minY = min.index / arrayInfo.xSize;
+    pStats->maxX = max.index % arrayInfo.xSize;
+    pStats->maxY = max.index / arrayInfo.xSize;
     pStats->net = pStats->total;
     pStats->mean = pStats->total / pStats->nElements;
     pStats->sigma = sqrt((pStats->sigma / pStats->nElements) - (pStats->mean * pStats->mean));
@@ -191,8 +210,7 @@ template <typename epicsType>
 asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 {
     epicsType *pData = (epicsType *)pArray->pData;
-    double value, *pValue, *pThresh, varX, varY, varXY;
-    size_t ix, iy;
+    double *pValue, *pThresh, varX, varY, varXY;
     /*Raw moments */
     double M00 = 0.0;
     double M10 = 0.0, M01 = 0.0;
@@ -204,40 +222,63 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 
     if (pArray->ndims > 2) return(asynError);
 
-    for (iy=0; iy<pStats->profileSizeY; iy++) {
-        for (ix=0; ix<pStats->profileSizeX; ix++) {
-            value = (double)*pData++;
-            pStats->profileX[profAverage][ix] += value;
-            pStats->profileY[profAverage][iy] += value;
+    const size_t w = pStats->profileSizeX;
+    const size_t h = pStats->profileSizeY;
+    double* px_avg = pStats->profileX[profAverage];
+    double* py_avg = pStats->profileY[profAverage];
+    double* px_thr = pStats->profileX[profThreshold];
+    double* py_thr = pStats->profileY[profThreshold];
+    #pragma omp parallel for reduction(+:M11, px_avg[:w], px_thr[:w])
+    for (size_t iy=0; iy<h; iy++) {
+        double local_py_avg = 0.0;
+        double local_py_thr = 0.0;
+        for (size_t ix=0; ix<w; ix++) {
+            const double value = pData[iy*w + ix];
+            px_avg[ix] += value;
+            local_py_avg += value;
             if (value >= pStats->centroidThreshold) {
-                pStats->profileX[profThreshold][ix] += value;
-                pStats->profileY[profThreshold][iy] += value;
+                px_thr[ix] += value;
+                local_py_thr += value;
                 M11 += value * ix * iy;
             }
         }
+        py_avg[iy] = local_py_avg;
+        py_thr[iy] = local_py_thr;
     }
 
     /* Normalize the average profiles and compute the centroid from them */
-    pValue  = pStats->profileX[profAverage];
-    pThresh = pStats->profileX[profThreshold];
-    for (ix=0; ix<pStats->profileSizeX; ix++, pValue++, pThresh++) {
-        M00 += *pThresh;
-        M10 += *pThresh * ix;
-        M20 += *pThresh * ix * ix;
-        M30 += *pThresh * ix * ix * ix;
-        M40 += *pThresh * ix * ix * ix * ix;
-        *pValue  /= pStats->profileSizeY;
-        *pThresh /= pStats->profileSizeY;
+    #pragma omp parallel num_threads(2)
+    #pragma omp single
+    {
+    #pragma omp task private(pValue, pThresh)
+    {
+        pValue  = pStats->profileX[profAverage];
+        pThresh = pStats->profileX[profThreshold];
+        for (size_t ix=0; ix<pStats->profileSizeX; ix++) {
+            const double value = pThresh[ix];
+            M00 += value;
+            M10 += value * ix;
+            M20 += value * ix * ix;
+            M30 += value * ix * ix * ix;
+            M40 += value * ix * ix * ix * ix;
+            pValue[ix]  /= pStats->profileSizeY;
+            pThresh[ix] /= pStats->profileSizeY;
+        }
     }
-    pValue  = pStats->profileY[profAverage];
-    pThresh = pStats->profileY[profThreshold];
-    for (iy=0; iy<pStats->profileSizeY; iy++, pValue++, pThresh++) {
-        M01 += *pThresh * iy;
-        M02 += *pThresh * iy * iy;
-        M03 += *pThresh * iy * iy * iy;
-        M04 += *pThresh * iy * iy * iy * iy;
-        *pValue  /= pStats->profileSizeX;
-        *pThresh /= pStats->profileSizeX;
+    #pragma omp task private(pValue, pThresh)
+    {
+        pValue  = pStats->profileY[profAverage];
+        pThresh = pStats->profileY[profThreshold];
+        for (size_t iy=0; iy<pStats->profileSizeY; iy++) {
+            const double value = pThresh[iy];
+            M01 += value * iy;
+            M02 += value * iy * iy;
+            M03 += value * iy * iy * iy;
+            M04 += value * iy * iy * iy * iy;
+            pValue[iy]  /= pStats->profileSizeX;
+            pThresh[iy] /= pStats->profileSizeX;
+        }
+    }
     }
 
     if (M00 > 0.) {
@@ -530,17 +571,25 @@ void NDPluginStats::processCallbacks(NDArray *pArray)
         }
     }
 
+    #pragma omp parallel
+    #pragma omp single
+    {
     if (computeCentroid) {
+        #pragma omp task depend(out: pStats)
          doComputeCentroid(pArray, pStats);
     }
 
     if (computeProfiles) {
+        #pragma omp task depend(in: pStats)
         doComputeProfiles(pArray, pStats);
     }
 
     if (computeHistogram) {
+        #pragma omp task
         doComputeHistogram(pArray, pStats);
     }
+    }
+
 
     // Take the lock again.  The time-series data need to be protected.
     this->lock();
