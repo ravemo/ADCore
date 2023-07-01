@@ -57,6 +57,7 @@ asynStatus NDPluginStats::doComputeHistogramT(NDArray *pArray, NDStats_t *pStats
     }
 
     entropy = 0;
+    #pragma omp parallel reduction(+:entropy) private(i, counts)
     for (i=0; (int)i<pStats->histSize; i++) {
         counts = pStats->histogram[i];
         if (counts <= 0) counts = 1;
@@ -116,7 +117,6 @@ void NDPluginStats::doComputeStatisticsT(NDArray *pArray, NDStats_t *pStats)
     size_t i, imin, imax;
     epicsType *pData = (epicsType *)pArray->pData;
     NDArrayInfo arrayInfo;
-    double value;
 
     pArray->getInfo(&arrayInfo);
     pStats->nElements = arrayInfo.nElements;
@@ -127,17 +127,19 @@ void NDPluginStats::doComputeStatisticsT(NDArray *pArray, NDStats_t *pStats)
     pStats->total = 0.;
     pStats->sigma = 0.;
     for (i=0; i<pStats->nElements; i++) {
-        value = (double)pData[i];
-        if (value < pStats->min) {
-            pStats->min = value;
+        if (pData[i] < pStats->min) {
+            pStats->min = pData[i];
             imin = i;
         }
-        if (value > pStats->max) {
-            pStats->max = value;
+        if (pData[i] > pStats->max) {
+            pStats->max = pData[i];
             imax = i;
         }
-        pStats->total += value;
-        pStats->sigma += value * value;
+    }
+    #pragma simd reduce(+:pStats->total, pStats->sigma)
+    for (i=0; i<pStats->nElements; i++) {
+        pStats->total += pData[i];
+        pStats->sigma += pData[i] * pData[i];
     }
     pStats->minX = imin % arrayInfo.xSize;
     pStats->minY = imin / arrayInfo.xSize;
@@ -555,16 +557,23 @@ void NDPluginStats::processCallbacks(NDArray *pArray)
         }
     }
 
-    if (computeCentroid) {
-         doComputeCentroid(pArray, pStats);
-    }
+    #pragma omp parallel
+    #pragma omp single
+    {
+        if (computeCentroid) {
+            #pragma omp task depend(out: pStats)
+            doComputeCentroid(pArray, pStats);
+        }
 
-    if (computeProfiles) {
-        doComputeProfiles(pArray, pStats);
-    }
+        if (computeProfiles) {
+            #pragma omp task depend(in: pStats) // depends on centroid
+            doComputeProfiles(pArray, pStats);
+        }
 
-    if (computeHistogram) {
-        doComputeHistogram(pArray, pStats);
+        if (computeHistogram) {
+            #pragma omp task
+            doComputeHistogram(pArray, pStats);
+        }
     }
 
     // Take the lock again.  The time-series data need to be protected.
