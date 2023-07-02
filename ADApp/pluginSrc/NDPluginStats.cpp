@@ -197,7 +197,6 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     double itime = omp_get_wtime();
     epicsType *pData = (epicsType *)pArray->pData;
     double *pValue, *pThresh, varX, varY, varXY;
-    size_t ix, iy;
     /*Raw moments */
     double M00 = 0.0;
     double M10 = 0.0, M01 = 0.0;
@@ -215,13 +214,12 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     double* py_avg = pStats->profileY[profAverage];
     double* px_thr = pStats->profileX[profThreshold];
     double* py_thr = pStats->profileY[profThreshold];
-    #pragma omp parallel for collapse(2) reduction(+:M11, \
-    px_avg[:w], py_avg[:h], px_thr[:w], py_thr[:h]) \
-    private(ix, iy)
-    for (iy=0; iy<pStats->profileSizeY; iy++) {
-        for (ix=0; ix<pStats->profileSizeX; ix++) {
-            const int i = iy*pStats->profileSizeX + ix;
-            const double value = pData[i];
+    //#pragma omp parallel for collapse(2) reduction(+:M11,
+    //px_avg[:w], py_avg[:h], px_thr[:w], py_thr[:h])
+    #pragma omp parallel for reduction(+:M11, px_avg[:w], px_thr[:w])
+    for (size_t iy=0; iy<h; iy++) {
+        for (size_t ix=0; ix<w; ix++) {
+            const double value = pData[iy*w + ix];
             px_avg[ix] += value;
             py_avg[iy] += value;
             if (value >= pStats->centroidThreshold) {
@@ -233,26 +231,40 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     }
 
     /* Normalize the average profiles and compute the centroid from them */
-    pValue  = pStats->profileX[profAverage];
-    pThresh = pStats->profileX[profThreshold];
-    for (ix=0; ix<pStats->profileSizeX; ix++, pValue++, pThresh++) {
-        M00 += *pThresh;
-        M10 += *pThresh * ix;
-        M20 += *pThresh * ix * ix;
-        M30 += *pThresh * ix * ix * ix;
-        M40 += *pThresh * ix * ix * ix * ix;
-        *pValue  /= pStats->profileSizeY;
-        *pThresh /= pStats->profileSizeY;
+    #pragma omp parallel
+    #pragma omp single
+    {
+    #pragma omp task private(pValue, pThresh)
+    {
+        pValue  = pStats->profileX[profAverage];
+        pThresh = pStats->profileX[profThreshold];
+        //#pragma omp parallel for reduction(+: M00, M10, M20, M30, M40)
+        for (size_t ix=0; ix<pStats->profileSizeX; ix++) {
+            const double value = pThresh[ix];
+            M00 += value;
+            M10 += value * ix;
+            M20 += value * ix * ix;
+            M30 += value * ix * ix * ix;
+            M40 += value * ix * ix * ix * ix;
+            pValue[ix]  /= pStats->profileSizeY;
+            pThresh[ix] /= pStats->profileSizeY;
+        }
     }
-    pValue  = pStats->profileY[profAverage];
-    pThresh = pStats->profileY[profThreshold];
-    for (iy=0; iy<pStats->profileSizeY; iy++, pValue++, pThresh++) {
-        M01 += *pThresh * iy;
-        M02 += *pThresh * iy * iy;
-        M03 += *pThresh * iy * iy * iy;
-        M04 += *pThresh * iy * iy * iy * iy;
-        *pValue  /= pStats->profileSizeX;
-        *pThresh /= pStats->profileSizeX;
+    #pragma omp task private(pValue, pThresh)
+    {
+        pValue  = pStats->profileY[profAverage];
+        pThresh = pStats->profileY[profThreshold];
+        //#pragma omp parallel for reduction(+: M01, M02, M03, M04)
+        for (size_t iy=0; iy<pStats->profileSizeY; iy++) {
+            const double value = pThresh[iy];
+            M01 += value * iy;
+            M02 += value * iy * iy;
+            M03 += value * iy * iy * iy;
+            M04 += value * iy * iy * iy * iy;
+            pValue[iy]  /= pStats->profileSizeX;
+            pThresh[iy] /= pStats->profileSizeX;
+        }
+    }
     }
 
     if (M00 > 0.) {
