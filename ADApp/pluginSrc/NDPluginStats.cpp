@@ -200,7 +200,6 @@ int NDPluginStats::doComputeStatistics(NDArray *pArray, NDStats_t *pStats)
 template <typename epicsType>
 asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
 {
-    double itime = omp_get_wtime();
     epicsType *pData = (epicsType *)pArray->pData;
     double *pValue, *pThresh, varX, varY, varXY;
     /*Raw moments */
@@ -220,8 +219,6 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     double* py_avg = pStats->profileY[profAverage];
     double* px_thr = pStats->profileX[profThreshold];
     double* py_thr = pStats->profileY[profThreshold];
-    //#pragma omp parallel for collapse(2) reduction(+:M11,
-    //px_avg[:w], py_avg[:h], px_thr[:w], py_thr[:h])
     #pragma omp parallel for reduction(+:M11, px_avg[:w], px_thr[:w])
     for (size_t iy=0; iy<h; iy++) {
         for (size_t ix=0; ix<w; ix++) {
@@ -244,7 +241,6 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     {
         pValue  = pStats->profileX[profAverage];
         pThresh = pStats->profileX[profThreshold];
-        //#pragma omp parallel for reduction(+: M00, M10, M20, M30, M40)
         for (size_t ix=0; ix<pStats->profileSizeX; ix++) {
             const double value = pThresh[ix];
             M00 += value;
@@ -260,7 +256,6 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     {
         pValue  = pStats->profileY[profAverage];
         pThresh = pStats->profileY[profThreshold];
-        //#pragma omp parallel for reduction(+: M01, M02, M03, M04)
         for (size_t iy=0; iy<pStats->profileSizeY; iy++) {
             const double value = pThresh[iy];
             M01 += value * iy;
@@ -316,8 +311,6 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
                                  ((mu20 + mu02) * (mu20 + mu02));
         }
     }
-    double ftime = omp_get_wtime();
-    //printf("Time taken is %f\n", ftime-itime);
     return(asynSuccess);
 }
 
