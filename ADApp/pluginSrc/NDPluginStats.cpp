@@ -33,33 +33,37 @@ template <typename epicsType>
 asynStatus NDPluginStats::doComputeHistogramT(NDArray *pArray, NDStats_t *pStats)
 {
     epicsType *pData = (epicsType *)pArray->pData;
-    size_t i;
     double scale, entropy;
-    int bin;
     size_t nElements;
-    double value, counts;
+    double counts;
     NDArrayInfo arrayInfo;
 
     pArray->getInfo(&arrayInfo);
     nElements = arrayInfo.nElements;
     scale = (pStats->histSize - 1) / (pStats->histMax - pStats->histMin);
 
-    pStats->histBelow = 0;
-    pStats->histAbove = 0;
-    for (i=0; i<nElements; i++) {
-        value = (double)pData[i];
-        bin = (int)(((value - pStats->histMin) * scale) + 0.5);
+    int histBelow = 0;
+    int histAbove = 0;
+    double* hist = pStats->histogram;
+    const int histSize = pStats->histSize;
+    #pragma omp parallel reduction(+: histBelow, histAbove, hist[:histSize])
+    for (size_t i=0; i<nElements; i++) {
+        double value = pData[i];
+        int bin = (int)(((value - pStats->histMin) * scale) + 0.5);
         if ((bin < 0) || (value < pStats->histMin))
-            pStats->histBelow++;
-        else if ((bin > (int)pStats->histSize-1) || (value > pStats->histMax))
-            pStats->histAbove++;
+            histBelow++;
+        else if ((bin > (int)histSize-1) || (value > pStats->histMax))
+            histAbove++;
         else
-            pStats->histogram[bin]++;
+            hist[bin]++;
     }
 
+    pStats->histBelow = histBelow;
+    pStats->histAbove = histAbove;
+    pStats->histogram = hist;
+
     entropy = 0;
-    #pragma omp parallel reduction(+:entropy) private(i, counts)
-    for (i=0; (int)i<pStats->histSize; i++) {
+    for (size_t i=0; (int)i<pStats->histSize; i++) {
         counts = pStats->histogram[i];
         if (counts <= 0) counts = 1;
         entropy += counts * log(counts);
@@ -221,16 +225,20 @@ asynStatus NDPluginStats::doComputeCentroidT(NDArray *pArray, NDStats_t *pStats)
     double* py_thr = pStats->profileY[profThreshold];
     #pragma omp parallel for reduction(+:M11, px_avg[:w], px_thr[:w])
     for (size_t iy=0; iy<h; iy++) {
+        double local_py_avg = 0.0;
+        double local_py_thr = 0.0;
         for (size_t ix=0; ix<w; ix++) {
             const double value = pData[iy*w + ix];
             px_avg[ix] += value;
-            py_avg[iy] += value;
+            local_py_avg += value;
             if (value >= pStats->centroidThreshold) {
                 px_thr[ix] += value;
-                py_thr[iy] += value;
+                local_py_thr += value;
                 M11 += value * ix * iy;
             }
         }
+        py_avg[iy] = local_py_avg;
+        py_thr[iy] = local_py_thr;
     }
 
     /* Normalize the average profiles and compute the centroid from them */
