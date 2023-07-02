@@ -203,6 +203,9 @@ void NDPluginDriver::beginProcessCallbacks(NDArray *pArray)
     pAttribute = pArray->pAttributeList->find("BayerPattern");
     if (pAttribute) pAttribute->getValue(NDAttrInt32, &bayerPattern);
 
+    if (arrayCounter == 0)
+        epicsTimeGetCurrent(&acquisitionTimer);
+
     getIntegerParam(NDArrayCounter, &arrayCounter);
     arrayCounter++;
     setIntegerParam(NDArrayCounter, arrayCounter);
@@ -253,6 +256,23 @@ asynStatus NDPluginDriver::endProcessCallbacks(NDArray *pArray, bool copyArray, 
     int droppedOutputArrays;
     NDArray *pArrayOut = pArray;
     static const char *functionName = "endProcessCallbacks";
+    int arrayCounter;
+
+    getIntegerParam(NDArrayCounter, &arrayCounter);
+
+    if (arrayCounter == 1000) {
+        epicsTimeStamp now;
+        epicsTimeGetCurrent(&now);
+        double time = epicsTimeDiffInSeconds(&now, &acquisitionTimer);
+
+        char filename[100];
+        sprintf(filename, "/tmp/%s.total", portName);
+        FILE* file = fopen(filename, "w");
+
+        fprintf(file, "%lf\n", time);
+
+        fclose(file);
+    }
 
     getIntegerParam(NDArrayCallbacks, &arrayCallbacks);
     if (arrayCallbacks == 0) {

@@ -138,6 +138,7 @@ private:
     int dimsPrev_[ND_ARRAY_MAX_DIMS];
     bool compressionAware_;
     Throttler *throttler_;
+    epicsTimeStamp acquisitionTimer;
 };
 
 
