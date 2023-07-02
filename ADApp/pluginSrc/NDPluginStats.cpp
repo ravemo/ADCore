@@ -112,39 +112,45 @@ asynStatus NDPluginStats::doComputeHistogram(NDArray *pArray, NDStats_t *pStats)
     return(status);
 }
 
+struct Compare { double val; size_t index; };    
+#pragma omp declare reduction(minimum : struct Compare : omp_out = omp_in.val < omp_out.val ? omp_in : omp_out)
+#pragma omp declare reduction(maximum : struct Compare : omp_out = omp_in.val > omp_out.val ? omp_in : omp_out)
+
 template <typename epicsType>
 void NDPluginStats::doComputeStatisticsT(NDArray *pArray, NDStats_t *pStats)
 {
-    size_t i, imin, imax;
     epicsType *pData = (epicsType *)pArray->pData;
     NDArrayInfo arrayInfo;
-    double value;
 
     pArray->getInfo(&arrayInfo);
     pStats->nElements = arrayInfo.nElements;
-    pStats->min = (double) pData[0];
-    imin = 0;
-    pStats->max = (double) pData[0];
-    imax = 0;
     pStats->total = 0.;
     pStats->sigma = 0.;
-    for (i=0; i<pStats->nElements; i++) {
-        value = (double)pData[i];
-        if (value < pStats->min) {
-            pStats->min = value;
-            imin = i;
+
+    struct Compare min{(double)pData[0], 0}, max{(double)pData[0], 0};
+    double total = 0, sigma = 0;
+    #pragma omp parallel for reduction(minimum:min) reduction(maximum:max) reduction(+: total, sigma)
+    for (size_t i=0; i<pStats->nElements; i++) {
+        double value = (double)pData[i];
+        if (value < min.val) {
+            min.val = value;
+            min.index = i;
         }
-        if (value > pStats->max) {
-            pStats->max = value;
-            imax = i;
+        if (value > max.val) {
+            max.val = value;
+            max.index = i;
         }
-        pStats->total += value;
-        pStats->sigma += value * value;
+        total += value;
+        sigma += value * value;
     }
-    pStats->minX = imin % arrayInfo.xSize;
-    pStats->minY = imin / arrayInfo.xSize;
-    pStats->maxX = imax % arrayInfo.xSize;
-    pStats->maxY = imax / arrayInfo.xSize;
+    pStats->total = total;
+    pStats->sigma = sigma;
+    pStats->min = min.val;
+    pStats->max = max.val;
+    pStats->minX = min.index % arrayInfo.xSize;
+    pStats->minY = min.index / arrayInfo.xSize;
+    pStats->maxX = max.index % arrayInfo.xSize;
+    pStats->maxY = max.index / arrayInfo.xSize;
     pStats->net = pStats->total;
     pStats->mean = pStats->total / pStats->nElements;
     pStats->sigma = sqrt((pStats->sigma / pStats->nElements) - (pStats->mean * pStats->mean));
